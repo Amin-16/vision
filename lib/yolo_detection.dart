@@ -1,10 +1,15 @@
 import 'dart:ui';
-
+import 'dart:io';
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'dart:async';
 import 'package:flutter_vision/flutter_vision.dart';
+import 'package:http/http.dart' as http;
+import 'dart:convert';
+import 'package:http_parser/http_parser.dart';
+import 'package:speech_to_text/speech_to_text.dart' as stt;
+import 'package:flutter_tts/flutter_tts.dart';
 
 late List<CameraDescription> cameras;
 
@@ -28,10 +33,220 @@ class _YoloVideoState extends State<YoloVideo> {
   String lastAnnouncement = '';
   Map<String, int> objectCounts = {};
 
+  // VQA related variables
+  File? _capturedImage;
+  bool _isListening = false;
+  final stt.SpeechToText _speech = stt.SpeechToText();
+  final FlutterTts _flutterTts = FlutterTts();
+  final String apiUrl = 'http://192.168.1.10:5000/predict';
+  bool _isProcessingVQA = false;
+  bool _showFrozenFrame = false;
+  Timer? _questionTimer;
+  OverlayEntry? _answerOverlay;
+
   @override
   void initState() {
     super.initState();
     init();
+    _initSpeech();
+    _initTts();
+  }
+
+  Future<void> _initTts() async {
+    await _flutterTts.setLanguage("en-US");
+    await _flutterTts.setSpeechRate(0.5);
+    await _flutterTts.setVolume(1.0);
+    await _flutterTts.setPitch(1.0);
+    await _flutterTts.awaitSpeakCompletion(true);
+  }
+
+  Future<void> _speakAnswer(String text) async {
+    await _flutterTts.stop();
+    await Future.delayed(const Duration(milliseconds: 150));
+    return _flutterTts.speak(text);
+  }
+
+  Future<void> _initSpeech() async {
+    await _speech.initialize(
+      onStatus: (status) {
+        if (status == 'done' && _isListening) {
+          setState(() => _isListening = false);
+        }
+      },
+      onError: (error) async {
+        print('Speech recognition error: $error');
+        // Handle error_no_match gracefully
+        if (error.errorMsg == 'error_no_match') {
+          setState(() {
+            _isListening = false;
+            _showFrozenFrame = false;
+          });
+          _resetVQAState();
+          await _speakAnswer("I didn't catch that. Please try again.");
+          HapticFeedback.heavyImpact();
+        }
+      },
+    );
+  }
+
+  void _resetVQAState() {
+    _flutterTts.stop(); // Stop any ongoing speech
+    setState(() {
+      _showFrozenFrame = false;
+      _isListening = false;
+      _isProcessingVQA = false;
+      _capturedImage = null;
+    });
+    _questionTimer?.cancel();
+  }
+
+  Future<void> _startListeningAndProcess() async {
+    if (!_isListening && !_isProcessingVQA) {
+      try {
+        // Capture the image first
+        if (controller.value.isStreamingImages) {
+          await stopDetection();
+        }
+
+        // Remove bounding boxes before freezing
+        setState(() {
+          yoloResults.clear();
+          objectCounts.clear();
+        });
+
+        // Take picture
+        final XFile image = await controller.takePicture();
+        _capturedImage = File(image.path);
+
+        // Show frozen frame and play sound
+        setState(() {
+          _showFrozenFrame = true;
+        });
+
+        HapticFeedback.heavyImpact();
+        // Wait for the ready prompt to complete before starting listening
+        await _speakAnswer("Ready for your question");
+
+        // Start listening only after TTS is complete
+        setState(() => _isListening = true);
+
+        // Set a timeout for the question
+        _questionTimer?.cancel();
+        _questionTimer = Timer(const Duration(seconds: 10), () async {
+          if (_isListening) {
+            await _speech.stop();
+            setState(() {
+              _showFrozenFrame = false;
+            });
+            _resetVQAState();
+            await _speakAnswer("No question detected. Please try again.");
+            HapticFeedback.heavyImpact();
+          }
+        });
+
+        await _speech.listen(
+          onResult: (result) async {
+            if (result.finalResult) {
+              _questionTimer?.cancel();
+              setState(() {
+                _isListening = false;
+                // _showFrozenFrame = false; // Do NOT unfreeze here
+              });
+              String question = result.recognizedWords;
+
+              if (question.trim().isEmpty) {
+                _resetVQAState();
+                await _speakAnswer(
+                    "I didn't hear a question. Please try again.");
+                return;
+              }
+
+              // Wait for confirmation message to complete before processing
+              await _speakAnswer("I heard: $question. Processing...");
+
+              // Process the question while keeping the image frozen
+              await _processVQA(question);
+            }
+          },
+          cancelOnError: true,
+          listenMode: stt.ListenMode.confirmation,
+        );
+      } catch (e) {
+        print('Error in VQA process: $e');
+        _resetVQAState();
+        await _speakAnswer("Sorry, there was an error. Please try again.");
+      }
+    }
+  }
+
+  void _showAnswerOverlay(String answer) {
+    _answerOverlay?.remove();
+    _answerOverlay = OverlayEntry(
+      builder: (context) => Positioned(
+        top: MediaQuery.of(context).padding.top + 24,
+        left: 18,
+        right: 18,
+        child: _ModernAnswerCard(answer: answer),
+      ),
+    );
+    Overlay.of(context, rootOverlay: true).insert(_answerOverlay!);
+    Future.delayed(const Duration(seconds: 5), () {
+      _answerOverlay?.remove();
+      _answerOverlay = null;
+      setState(() {
+        _showFrozenFrame = false;
+      });
+    });
+  }
+
+  Future<void> _processVQA(String question) async {
+    setState(() => _isProcessingVQA = true);
+
+    try {
+      var request = http.MultipartRequest('POST', Uri.parse(apiUrl));
+      request.fields['question'] = question;
+      request.files.add(await http.MultipartFile.fromPath(
+        'image',
+        _capturedImage!.path,
+        contentType: MediaType('image', 'jpeg'),
+      ));
+
+      var response = await request.send();
+      var responseData = await http.Response.fromStream(response);
+
+      if (response.statusCode == 200) {
+        var jsonResponse = jsonDecode(responseData.body);
+        String answer = jsonResponse['answer'];
+
+        // Show the answer as a modern overlay at the top
+        if (mounted) {
+          _showAnswerOverlay(answer);
+        }
+        // Wait for the answer to be completely spoken
+        await _speakAnswer(answer);
+      } else {
+        await _speakAnswer(
+            "Sorry, I couldn't process the image. Please try again.");
+      }
+    } catch (e) {
+      await _speakAnswer("Sorry, there was an error. Please try again.");
+    } finally {
+      setState(() {
+        _isProcessingVQA = false;
+      });
+      _capturedImage = null;
+    }
+  }
+
+  @override
+  void dispose() {
+    detectionTimer?.cancel();
+    announcementTimer?.cancel();
+    _questionTimer?.cancel();
+    _speech.stop();
+    _flutterTts.stop();
+    super.dispose();
+    controller.dispose();
   }
 
   init() async {
@@ -52,12 +267,17 @@ class _YoloVideoState extends State<YoloVideo> {
     });
   }
 
-  @override
-  void dispose() async {
-    detectionTimer?.cancel();
-    announcementTimer?.cancel();
-    super.dispose();
-    await controller.dispose();
+  Future<void> loadYoloModel() async {
+    await widget.vision.loadYoloModel(
+      labels: 'assets/labels.txt',
+      modelPath: 'assets/yolov8n.tflite',
+      modelVersion: "yolov8",
+      numThreads: 4,
+      useGpu: true,
+    );
+    setState(() {
+      isLoaded = true;
+    });
   }
 
   @override
@@ -91,14 +311,22 @@ class _YoloVideoState extends State<YoloVideo> {
       body: Stack(
         fit: StackFit.expand,
         children: [
-          // Camera Preview
-          Semantics(
-            label: 'Camera view for object detection',
-            child: AspectRatio(
-              aspectRatio: controller.value.aspectRatio,
-              child: CameraPreview(controller),
+          // Camera Preview or Frozen Frame
+          if (_showFrozenFrame && _capturedImage != null)
+            Positioned.fill(
+              child: Image.file(
+                _capturedImage!,
+                fit: BoxFit.cover,
+              ),
+            )
+          else
+            Semantics(
+              label: 'Camera view for object detection',
+              child: AspectRatio(
+                aspectRatio: controller.value.aspectRatio,
+                child: CameraPreview(controller),
+              ),
             ),
-          ),
 
           // Detection boxes
           ...displayBoxesAroundRecognizedObjects(size),
@@ -108,184 +336,157 @@ class _YoloVideoState extends State<YoloVideo> {
             bottom: 0,
             left: 0,
             right: 0,
-            child: Container(
-              decoration: BoxDecoration(
-                gradient: LinearGradient(
-                  begin: Alignment.bottomCenter,
-                  end: Alignment.topCenter,
-                  colors: [
-                    Colors.black.withOpacity(0.8),
-                    Colors.transparent,
-                  ],
-                  stops: const [0.0, 1.0],
-                ),
-              ),
-              padding: const EdgeInsets.all(20),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  // Detection Status
-                  Container(
-                    padding:
-                        const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                    decoration: BoxDecoration(
-                      color: isDetecting
-                          ? Colors.green.withOpacity(0.9)
-                          : Colors.grey.withOpacity(0.9),
-                      borderRadius: BorderRadius.circular(20),
-                    ),
-                    child: Text(
-                      isDetecting ? 'Detection Active' : 'Detection Stopped',
-                      style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 16,
-                        fontWeight: FontWeight.bold,
-                      ),
-                      semanticsLabel: isDetecting
-                          ? 'Object detection is currently running'
-                          : 'Object detection is stopped',
-                    ),
-                  ),
-
-                  const SizedBox(height: 16),
-
-                  // Main Control Button
-                  Semantics(
-                    label: isDetecting
-                        ? 'Stop object detection'
-                        : 'Start object detection',
-                    hint: isDetecting
-                        ? 'Double tap to stop detecting objects in camera view'
-                        : 'Double tap to start detecting objects in camera view',
-                    child: GestureDetector(
-                      onTap: () async {
-                        HapticFeedback.heavyImpact();
-                        if (isDetecting) {
-                          await stopDetection();
-                        } else {
-                          await startDetection();
-                        }
-                      },
-                      child: Container(
-                        width: 80,
-                        height: 80,
-                        decoration: BoxDecoration(
-                          shape: BoxShape.circle,
-                          color: isDetecting
-                              ? Colors.red.shade600
-                              : Colors.green.shade600,
-                          boxShadow: [
-                            BoxShadow(
-                              color: (isDetecting ? Colors.red : Colors.green)
-                                  .withOpacity(0.4),
-                              blurRadius: 15,
-                              spreadRadius: 2,
-                            ),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 22),
+              child: AnimatedOpacity(
+                opacity: 1.0,
+                duration: const Duration(milliseconds: 400),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(36),
+                  child: BackdropFilter(
+                    filter: ImageFilter.blur(sigmaX: 18, sigmaY: 18),
+                    child: Container(
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(
+                          colors: [
+                            Colors.white.withOpacity(0.18),
+                            Colors.white.withOpacity(0.08),
                           ],
-                          border: Border.all(
-                            width: 4,
-                            color: Colors.white,
+                          begin: Alignment.topLeft,
+                          end: Alignment.bottomRight,
+                        ),
+                        borderRadius: BorderRadius.circular(36),
+                        border: Border.all(
+                          width: 2.5,
+                          style: BorderStyle.solid,
+                          color: Colors.blueAccent.withOpacity(0.18),
+                        ),
+                        boxShadow: [
+                          BoxShadow(
+                            color: Colors.black.withOpacity(0.18),
+                            blurRadius: 24,
+                            offset: const Offset(0, 10),
                           ),
-                        ),
-                        child: Icon(
-                          isDetecting ? Icons.stop : Icons.play_arrow,
-                          color: Colors.white,
-                          size: 40,
-                        ),
+                        ],
+                      ),
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 12, vertical: 10),
+                      child: AnimatedSwitcher(
+                        duration: const Duration(milliseconds: 400),
+                        switchInCurve: Curves.easeInOutCubic,
+                        switchOutCurve: Curves.easeInOutCubic,
+                        child: _isListening
+                            ? _ListeningMicPanel(timer: _questionTimer)
+                            : _isProcessingVQA
+                                ? const _ProcessingPanel()
+                                : Row(
+                                    mainAxisAlignment:
+                                        MainAxisAlignment.spaceEvenly,
+                                    children: [
+                                      // Detection Status
+                                      Flexible(
+                                        fit: FlexFit.tight,
+                                        child: AnimatedContainer(
+                                          duration:
+                                              const Duration(milliseconds: 300),
+                                          padding: const EdgeInsets.symmetric(
+                                              horizontal: 14, vertical: 12),
+                                          decoration: BoxDecoration(
+                                            color: isDetecting
+                                                ? Colors.green.withOpacity(0.92)
+                                                : Colors.grey.withOpacity(0.92),
+                                            borderRadius:
+                                                BorderRadius.circular(32),
+                                            boxShadow: [
+                                              if (isDetecting)
+                                                BoxShadow(
+                                                  color: Colors.green
+                                                      .withOpacity(0.25),
+                                                  blurRadius: 16,
+                                                  spreadRadius: 2,
+                                                ),
+                                            ],
+                                          ),
+                                          child: AnimatedDefaultTextStyle(
+                                            duration: const Duration(
+                                                milliseconds: 300),
+                                            style: TextStyle(
+                                              color: Colors.white,
+                                              fontSize: 16,
+                                              fontWeight: FontWeight.bold,
+                                              letterSpacing: 0.2,
+                                              shadows: isDetecting
+                                                  ? [
+                                                      const Shadow(
+                                                        color: Colors.black45,
+                                                        blurRadius: 4,
+                                                      ),
+                                                    ]
+                                                  : [],
+                                            ),
+                                            child: Text(
+                                              isDetecting
+                                                  ? 'Detection Active'
+                                                  : 'Detection Stopped',
+                                              semanticsLabel: isDetecting
+                                                  ? 'Object detection is currently running'
+                                                  : 'Object detection is stopped',
+                                              overflow: TextOverflow.ellipsis,
+                                            ),
+                                          ),
+                                        ),
+                                      ),
+                                      const SizedBox(width: 12),
+                                      // Detection Control Button (hide during VQA)
+                                      if (!_isListening && !_isProcessingVQA)
+                                        _AnimatedActionButton(
+                                          icon: isDetecting
+                                              ? Icons.stop
+                                              : Icons.play_arrow,
+                                          color: isDetecting
+                                              ? Colors.red
+                                              : Colors.green,
+                                          onTap: () async {
+                                            HapticFeedback.heavyImpact();
+                                            if (isDetecting) {
+                                              await stopDetection();
+                                            } else {
+                                              await startDetection();
+                                            }
+                                          },
+                                          semanticLabel: isDetecting
+                                              ? 'Stop object detection'
+                                              : 'Start object detection',
+                                          semanticHint: isDetecting
+                                              ? 'Double tap to stop detecting objects in camera view'
+                                              : 'Double tap to start detecting objects in camera view',
+                                          isActive: isDetecting,
+                                        ),
+                                      if (!_isListening && !_isProcessingVQA)
+                                        const SizedBox(width: 12),
+                                      // VQA Button (always visible in normal state)
+                                      if (!_isListening && !_isProcessingVQA)
+                                        _AnimatedActionButton(
+                                          icon: Icons.question_answer,
+                                          color: Colors.blue,
+                                          onTap: () async {
+                                            if (!_isListening &&
+                                                !_isProcessingVQA) {
+                                              await _startListeningAndProcess();
+                                            }
+                                          },
+                                          semanticLabel:
+                                              'Ask a question about what you see',
+                                          semanticHint:
+                                              'Double tap to take a picture and ask a question by voice',
+                                          isActive: false,
+                                        ),
+                                    ],
+                                  ),
                       ),
                     ),
                   ),
-                ],
-              ),
-            ),
-          ),
-
-          // Status Panel at Top
-          Positioned(
-            top: 20,
-            left: 16,
-            right: 16,
-            child: Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: Colors.black.withOpacity(0.8),
-                borderRadius: BorderRadius.circular(12),
-                boxShadow: [
-                  BoxShadow(
-                    color: Colors.black.withOpacity(0.3),
-                    blurRadius: 10,
-                    offset: const Offset(0, 4),
-                  ),
-                ],
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      Semantics(
-                        label:
-                            'Number of objects detected: ${yoloResults.length}',
-                        child: Text(
-                          'Objects: ${yoloResults.length}',
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 18,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                      ),
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 8, vertical: 4),
-                        decoration: BoxDecoration(
-                          color: isProcessing ? Colors.orange : Colors.green,
-                          borderRadius: BorderRadius.circular(12),
-                        ),
-                        child: Text(
-                          isProcessing ? 'Processing...' : 'Ready',
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 12,
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                  if (objectCounts.isNotEmpty) ...[                    
-                    const SizedBox(height: 8),
-                    const Divider(color: Colors.white54),
-                    const SizedBox(height: 8),
-                    Semantics(
-                      label:
-                          'Detected objects summary: ${_getObjectCountsAnnouncement()}',
-                      child: Wrap(
-                        spacing: 8,
-                        runSpacing: 4,
-                        children: objectCounts.entries.map((entry) {
-                          return Container(
-                            padding: const EdgeInsets.symmetric(
-                                horizontal: 8, vertical: 4),
-                            decoration: BoxDecoration(
-                              color: Colors.blue.withOpacity(0.7),
-                              borderRadius: BorderRadius.circular(16),
-                            ),
-                            child: Text(
-                              '${entry.key}: ${entry.value}',
-                              style: const TextStyle(
-                                color: Colors.white,
-                                fontSize: 12,
-                                fontWeight: FontWeight.w500,
-                              ),
-                            ),
-                          );
-                        }).toList(),
-                      ),
-                    ),
-                  ],
-                ],
+                ),
               ),
             ),
           ),
@@ -303,19 +504,6 @@ class _YoloVideoState extends State<YoloVideo> {
     });
 
     return announcements.join(', ');
-  }
-
-  Future<void> loadYoloModel() async {
-    await widget.vision.loadYoloModel(
-      labels: 'assets/labels.txt',
-      modelPath: 'assets/yolov8n.tflite',
-      modelVersion: "yolov8",
-      numThreads: 4,
-      useGpu: true,
-    );
-    setState(() {
-      isLoaded = true;
-    });
   }
 
   Future<void> yoloOnFrame(CameraImage cameraImage) async {
@@ -401,7 +589,7 @@ class _YoloVideoState extends State<YoloVideo> {
       return;
     }
 
-    // Process frames at 5 FPS for better performance and battery life
+    // Process frames at 5 FPS
     detectionTimer = Timer.periodic(const Duration(milliseconds: 200), (timer) {
       if (!isDetecting) {
         timer.cancel();
@@ -437,7 +625,7 @@ class _YoloVideoState extends State<YoloVideo> {
   }
 
   List<Widget> displayBoxesAroundRecognizedObjects(Size screen) {
-    if (yoloResults.isEmpty) return [];
+    if (!isDetecting || yoloResults.isEmpty) return [];
 
     double factorX = screen.width / (cameraImage?.height ?? 1);
     double factorY = screen.height / (cameraImage?.width ?? 1);
@@ -510,4 +698,312 @@ class _YoloVideoState extends State<YoloVideo> {
     Colors.teal,
     Colors.brown,
   ];
+}
+
+class _AnimatedActionButton extends StatefulWidget {
+  final IconData icon;
+  final Color color;
+  final VoidCallback onTap;
+  final String semanticLabel;
+  final String semanticHint;
+  final bool isActive;
+  const _AnimatedActionButton({
+    required this.icon,
+    required this.color,
+    required this.onTap,
+    required this.semanticLabel,
+    required this.semanticHint,
+    this.isActive = false,
+    Key? key,
+  }) : super(key: key);
+
+  @override
+  State<_AnimatedActionButton> createState() => _AnimatedActionButtonState();
+}
+
+class _AnimatedActionButtonState extends State<_AnimatedActionButton> {
+  bool _pressed = false;
+  @override
+  Widget build(BuildContext context) {
+    return Semantics(
+      label: widget.semanticLabel,
+      hint: widget.semanticHint,
+      child: GestureDetector(
+        onTapDown: (_) => setState(() => _pressed = true),
+        onTapUp: (_) => setState(() => _pressed = false),
+        onTapCancel: () => setState(() => _pressed = false),
+        onTap: widget.onTap,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 200),
+          curve: Curves.easeInOut,
+          width: _pressed ? 62 : 70,
+          height: _pressed ? 62 : 70,
+          decoration: BoxDecoration(
+            gradient: LinearGradient(
+              colors: [
+                widget.color.withOpacity(0.85),
+                widget.color.withOpacity(0.65),
+              ],
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+            ),
+            shape: BoxShape.circle,
+            boxShadow: [
+              BoxShadow(
+                color: widget.color.withOpacity(widget.isActive ? 0.5 : 0.25),
+                blurRadius: widget.isActive ? 18 : 8,
+                spreadRadius: widget.isActive ? 2 : 0,
+                offset: const Offset(0, 6),
+              ),
+            ],
+            border: Border.all(
+              color: Colors.white.withOpacity(0.7),
+              width: widget.isActive ? 3 : 1.5,
+            ),
+          ),
+          child: Center(
+            child: AnimatedSwitcher(
+              duration: const Duration(milliseconds: 250),
+              child: Icon(
+                widget.icon,
+                key: ValueKey(widget.icon),
+                color: Colors.white,
+                size: 36,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ListeningMicPanel extends StatefulWidget {
+  final Timer? timer;
+  const _ListeningMicPanel({Key? key, required this.timer}) : super(key: key);
+
+  @override
+  State<_ListeningMicPanel> createState() => _ListeningMicPanelState();
+}
+
+class _ListeningMicPanelState extends State<_ListeningMicPanel> {
+  double _progress = 1.0;
+  late Timer _localTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    _progress = 1.0;
+    _localTimer = Timer.periodic(const Duration(milliseconds: 100), (timer) {
+      setState(() {
+        _progress -= 0.01;
+        if (_progress <= 0) {
+          _progress = 0;
+          timer.cancel();
+        }
+      });
+    });
+  }
+
+  @override
+  void dispose() {
+    _localTimer.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 400),
+      curve: Curves.easeInOutCubic,
+      width: double.infinity,
+      height: 80,
+      child: Center(
+        child: Stack(
+          alignment: Alignment.center,
+          children: [
+            SizedBox(
+              width: 70,
+              height: 70,
+              child: CircularProgressIndicator(
+                value: _progress,
+                strokeWidth: 6,
+                backgroundColor: Colors.white.withOpacity(0.15),
+                valueColor: AlwaysStoppedAnimation<Color>(Colors.redAccent),
+              ),
+            ),
+            Container(
+              width: 62,
+              height: 62,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                gradient: LinearGradient(
+                  colors: [Colors.redAccent, Colors.red.shade700],
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                ),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.redAccent.withOpacity(0.3),
+                    blurRadius: 16,
+                    offset: const Offset(0, 6),
+                  ),
+                ],
+              ),
+              child: const Icon(Icons.mic, color: Colors.white, size: 36),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _ProcessingPanel extends StatelessWidget {
+  const _ProcessingPanel({Key? key}) : super(key: key);
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 400),
+      curve: Curves.easeInOutCubic,
+      width: double.infinity,
+      height: 80,
+      child: Center(
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const SizedBox(
+              width: 48,
+              height: 48,
+              child: CircularProgressIndicator(
+                strokeWidth: 6,
+                valueColor: AlwaysStoppedAnimation<Color>(Colors.orange),
+                backgroundColor: Colors.white24,
+              ),
+            ),
+            const SizedBox(width: 18),
+            Text(
+              'Processing...',
+              style: TextStyle(
+                color: Colors.orange.shade700,
+                fontSize: 22,
+                fontWeight: FontWeight.bold,
+                letterSpacing: 0.2,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _ModernAnswerCard extends StatefulWidget {
+  final String answer;
+  const _ModernAnswerCard({required this.answer});
+
+  @override
+  State<_ModernAnswerCard> createState() => _ModernAnswerCardState();
+}
+
+class _ModernAnswerCardState extends State<_ModernAnswerCard>
+    with SingleTickerProviderStateMixin {
+  late AnimationController _controller;
+  late Animation<double> _scaleAnim;
+  late Animation<double> _fadeAnim;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 500),
+    );
+    _scaleAnim = CurvedAnimation(parent: _controller, curve: Curves.elasticOut);
+    _fadeAnim = CurvedAnimation(parent: _controller, curve: Curves.easeIn);
+    _controller.forward();
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FadeTransition(
+      opacity: _fadeAnim,
+      child: ScaleTransition(
+        scale: _scaleAnim,
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(28),
+          child: BackdropFilter(
+            filter: ImageFilter.blur(sigmaX: 18, sigmaY: 18),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 28, vertical: 22),
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  colors: [
+                    Colors.blue.shade700.withOpacity(0.85),
+                    Colors.purple.shade400.withOpacity(0.75),
+                  ],
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                ),
+                borderRadius: BorderRadius.circular(28),
+                border: Border.all(
+                  color: Colors.white.withOpacity(0.25),
+                  width: 2.5,
+                ),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.blueAccent.withOpacity(0.18),
+                    blurRadius: 24,
+                    offset: const Offset(0, 8),
+                  ),
+                ],
+              ),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  ShaderMask(
+                    shaderCallback: (rect) => LinearGradient(
+                      colors: [Colors.amber, Colors.yellow, Colors.orange],
+                    ).createShader(rect),
+                    child: const Icon(
+                      Icons.emoji_objects_rounded,
+                      size: 38,
+                      color: Colors.white,
+                    ),
+                  ),
+                  const SizedBox(width: 18),
+                  Expanded(
+                    child: Text(
+                      widget.answer,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 22,
+                        fontWeight: FontWeight.w700,
+                        letterSpacing: 0.2,
+                        shadows: [
+                          Shadow(
+                            color: Colors.black38,
+                            blurRadius: 6,
+                            offset: Offset(0, 2),
+                          ),
+                        ],
+                      ),
+                      textAlign: TextAlign.center,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 }
